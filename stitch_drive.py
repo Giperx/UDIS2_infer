@@ -56,12 +56,12 @@ def state_of(path):
     return checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
 
 
-def load_image(path):
+def load_image(path, size):
     image = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if image is None:
         raise SystemExit(f"missing {path}")
     original = image
-    resized = cv2.resize(image, (512, 512), interpolation=cv2.INTER_AREA).astype(np.float32)
+    resized = cv2.resize(image, size, interpolation=cv2.INTER_AREA).astype(np.float32)
     tensor = torch.from_numpy(np.transpose((resized / 127.5) - 1.0, (2, 0, 1))).unsqueeze(0).cuda()
     return tensor, original
 
@@ -90,8 +90,9 @@ def main():
     comp_net = composition.Network().cuda().eval()
     warp_net.load_state_dict(state_of(args.warp))
     comp_net.load_state_dict(state_of(args.composition))
-    left, _original = load_image(image_dir / f"{frame}_5.jpg")
-    right, _original = load_image(image_dir / f"{frame}_{args.side}.jpg")
+    size = (518, 434) if "1224" in args.dataset else (518, 294)
+    left, _original = load_image(image_dir / f"{frame}_5.jpg", size)
+    right, _original = load_image(image_dir / f"{frame}_{args.side}.jpg", size)
     with torch.no_grad():
         warped = warp.build_output_model(warp_net, left, right)
         stitched = composition.build_model(
