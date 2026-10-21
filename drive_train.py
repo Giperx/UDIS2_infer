@@ -37,7 +37,7 @@ import cv2
 import numpy as np
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 _LEGACY = Path("/home/test/LIVA/XZP/FeedForward/work2/0923_synGithub/datasets")
 WORK = _LEGACY if _LEGACY.exists() else ROOT.parent / "datasets"
@@ -50,6 +50,10 @@ PARTS = {
     "nuscenes": [(WORK / "nuscenes/processed_10Hz_v2", "nuScenes_Train.txt")],
     "lyft1920": [(WORK / "lyft/lyft_train1920_3cams", "train1920.txt")],
     "lyft1224": [(WORK / "lyft/lyft_train1224_3cams", "train1224.txt")],
+    "lyft": [
+        (WORK / "lyft/lyft_train1920_3cams", "train1920.txt"),
+        (WORK / "lyft/lyft_train1224_3cams", "train1224.txt"),
+    ],
     "widedrive3": [(WORK / "WideDrive3_processed/WideDriveTrain", "train.txt")],
 }
 
@@ -78,9 +82,9 @@ def read_list(path):
 
 class Pairs(Dataset):
     def __init__(self, parts, limit=0, size=(518, 294)):
-        self.size = size
         self.samples = []
         for root, name in parts:
+            part_size = camera_size(str(root))
             for scene in read_list(root / name):
                 image_dir = root / scene / "images"
                 if not image_dir.is_dir():
@@ -92,8 +96,8 @@ class Pairs(Dataset):
                         frames.setdefault(frame, set()).add(cam)
                 for frame, cams in frames.items():
                     if {"3", "4", "5"} <= cams:
-                        self.samples.append((image_dir / f"{frame}_5.jpg", image_dir / f"{frame}_4.jpg"))
-                        self.samples.append((image_dir / f"{frame}_5.jpg", image_dir / f"{frame}_3.jpg"))
+                        self.samples.append((image_dir / f"{frame}_5.jpg", image_dir / f"{frame}_4.jpg", part_size))
+                        self.samples.append((image_dir / f"{frame}_5.jpg", image_dir / f"{frame}_3.jpg", part_size))
         if limit:
             random.Random(0).shuffle(self.samples)
             self.samples = self.samples[:limit]
@@ -105,23 +109,60 @@ class Pairs(Dataset):
         return len(self.samples)
 
     def __getitem__(self, index):
-        left, right = self.samples[index]
+        left, right, size = self.samples[index]
         if random.randint(0, 1):
             left, right = right, left
-        return image(left, self.size), image(right, self.size)
+        return image(left, size), image(right, size)
 
 
 def image(path, size):
     array = cv2.imread(str(path), cv2.IMREAD_COLOR)
-    array = cv2.resize(array, size, interpolation=cv2.INTER_AREA).astype(np.float32)
+    array = cv2.resize(array, size, interpolation=cv2.INTER_AREA)
+    array = cv2.resize(array, (512, 512), interpolation=cv2.INTER_AREA).astype(np.float32)
     array = (array / 127.5) - 1.0
     return torch.from_numpy(np.transpose(array, (2, 0, 1)).copy())
+
+
+class SameSizeBatches(Sampler):
+    def __init__(self, sizes, batch_size, seed=0):
+        self.sizes = [tuple(size) for size in sizes]
+        self.batch_size = batch_size
+        self.seed = seed
+
+    def __iter__(self):
+        groups = {}
+        for index, size in enumerate(self.sizes):
+            groups.setdefault(size, []).append(index)
+        rng = random.Random(self.seed)
+        batches = []
+        for indexes in groups.values():
+            rng.shuffle(indexes)
+            for start in range(0, len(indexes) - self.batch_size + 1, self.batch_size):
+                batches.append(indexes[start:start + self.batch_size])
+        rng.shuffle(batches)
+        return iter(batches)
+
+    def __len__(self):
+        groups = {}
+        for size in self.sizes:
+            groups[size] = groups.get(size, 0) + 1
+        return sum(count // self.batch_size for count in groups.values())
 
 
 def train_warp(args, epochs):
     warp = load_module("udis_warp_net", ROOT / "Warp" / "Codes" / "network.py")
     loss_fn = load_module("udis_warp_loss", ROOT / "Warp" / "Codes" / "loss.py")
-    loader = DataLoader(Pairs(PARTS[args.dataset], args.limit, camera_size(args.dataset)), batch_size=args.warp_batch, shuffle=True, num_workers=args.workers, drop_last=True)
+    data = Pairs(PARTS[args.dataset], args.limit)
+    sizes = [sample[2] for sample in data.samples]
+    if len(set(sizes)) > 1:
+        loader = DataLoader(
+            data,
+            batch_sampler=SameSizeBatches(sizes, args.warp_batch, args.seed if hasattr(args, "seed") else 0),
+            num_workers=args.workers,
+            pin_memory=True,
+        )
+    else:
+        loader = DataLoader(data, batch_size=args.warp_batch, shuffle=True, num_workers=args.workers, drop_last=True)
     net = warp.Network().cuda().train()
     weight = args.warp_weight or str(ROOT / "pretrained" / "Warp" / "epoch100_model.pth")
     net.load_state_dict(state_of(weight))
@@ -234,17 +275,14 @@ def main():
     parser.add_argument("--max-steps", type=int, default=0)
     parser.add_argument("--limit", type=int, default=0)
     args = parser.parse_args()
-    names = ("lyft1920", "lyft1224") if args.dataset == "lyft" else (args.dataset,)
-    for name in names:
-        args.dataset = name
-        epochs = args.epochs or EPOCHS[name]
-        warp_path = ROOT / "outputs" / "finetune" / name / "warp" / f"epoch_{epochs}.pth"
-        if args.stage in ("both", "warp"):
-            warp_path = train_warp(args, epochs)
-        if args.stage in ("both", "composition"):
-            if not Path(warp_path).is_file():
-                warp_path = Path(args.warp_weight or ROOT / "pretrained" / "Warp" / "epoch100_model.pth")
-            train_composition(args, epochs, warp_path)
+    epochs = args.epochs or EPOCHS[args.dataset]
+    warp_path = ROOT / "outputs" / "finetune" / args.dataset / "warp" / f"epoch_{epochs}.pth"
+    if args.stage in ("both", "warp"):
+        warp_path = train_warp(args, epochs)
+    if args.stage in ("both", "composition"):
+        if not Path(warp_path).is_file():
+            warp_path = Path(args.warp_weight or ROOT / "pretrained" / "Warp" / "epoch100_model.pth")
+        train_composition(args, epochs, warp_path)
 
 
 if __name__ == "__main__":
