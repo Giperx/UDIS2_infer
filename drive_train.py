@@ -149,6 +149,35 @@ class SameSizeBatches(Sampler):
         return sum(count // self.batch_size for count in groups.values())
 
 
+def stable_step(optimizer, parameters, max_growth=3.0):
+    params = [p for p in parameters if p.requires_grad]
+    for p in params:
+        if p.grad is not None and not torch.isfinite(p.grad).all():
+            optimizer.zero_grad(set_to_none=True)
+            return "nonfinite grad"
+    with torch.no_grad():
+        before = torch.zeros((), device=params[0].device)
+        saved = [p.detach().clone() for p in params]
+        for p in params:
+            before = before + p.detach().float().pow(2).sum()
+        before = torch.sqrt(before)
+    optimizer.step()
+    with torch.no_grad():
+        after = torch.zeros((), device=params[0].device)
+        bad = any(not torch.isfinite(p).all() for p in params)
+        if not bad:
+            for p in params:
+                after = after + p.detach().float().pow(2).sum()
+            after = torch.sqrt(after)
+            bad = float(before) > 0 and float(after) > max_growth * float(before)
+        if bad:
+            for p, old in zip(params, saved):
+                p.copy_(old)
+            optimizer.zero_grad(set_to_none=True)
+            return "weight x{:.1f}".format(float(after) / max(float(before), 1e-12))
+    return ""
+
+
 def train_warp(args, epochs):
     warp = load_module("udis_warp_net", ROOT / "Warp" / "Codes" / "network.py")
     loss_fn = load_module("udis_warp_loss", ROOT / "Warp" / "Codes" / "loss.py")
@@ -172,6 +201,8 @@ def train_warp(args, epochs):
     steps = 0
     for epoch in range(epochs):
         for index, (left, right) in enumerate(loader):
+            if args.max_steps and index >= args.max_steps:
+                break
             left = left.float().cuda(non_blocking=True)
             right = right.float().cuda(non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
@@ -179,18 +210,23 @@ def train_warp(args, epochs):
             overlap = loss_fn.cal_lp_loss(left, right, out["output_H"], out["output_H_inv"], out["warp_mesh"], out["warp_mesh_mask"])
             regular = 10 * loss_fn.inter_grid_loss(out["overlap"], out["mesh2"]) + 10 * loss_fn.intra_grid_loss(out["mesh2"])
             loss = overlap + regular
+            if not torch.isfinite(loss):
+                print(f"skip warp step {index + 1}: nonfinite loss", flush=True)
+                optimizer.zero_grad(set_to_none=True)
+                continue
             loss.backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), 3)
-            optimizer.step()
+            reason = stable_step(optimizer, net.parameters())
+            if reason:
+                print(f"skip warp step {index + 1}: {reason}", flush=True)
+                continue
             steps += 1
             if index % 20 == 0:
                 print(f"warp epoch {epoch + 1}/{epochs} step {index + 1} loss {float(loss):.4f}", flush=True)
-            if args.max_steps and steps >= args.max_steps:
-                break
         path = save_dir / f"epoch_{epoch + 1}.pth"
         torch.save({"model": net.state_dict(), "epoch": epoch + 1}, path)
         print(f"saved {path}", flush=True)
-        if args.max_steps and steps >= args.max_steps:
+        if args.max_steps and index + 1 >= args.max_steps:
             return path
     return save_dir / f"epoch_{epochs}.pth"
 
@@ -213,6 +249,8 @@ def train_composition(args, epochs, warp_path):
     steps = skipped = 0
     for epoch in range(epochs):
         for index, (left, right) in enumerate(loader):
+            if args.max_steps and index >= args.max_steps:
+                break
             left = left.float().cuda(non_blocking=True)
             right = right.float().cuda(non_blocking=True)
             try:
@@ -243,7 +281,9 @@ def train_composition(args, epochs, warp_path):
                     raise RuntimeError("non-finite")
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(net.parameters(), 3)
-                optimizer.step()
+                reason = stable_step(optimizer, net.parameters())
+                if reason:
+                    raise RuntimeError(reason)
             except RuntimeError as exc:
                 skipped += 1
                 print(f"skip composition {index}: {exc}", flush=True)
@@ -257,7 +297,7 @@ def train_composition(args, epochs, warp_path):
         path = save_dir / f"epoch_{epoch + 1}.pth"
         torch.save({"model": net.state_dict(), "epoch": epoch + 1}, path)
         print(f"saved {path} skipped {skipped}", flush=True)
-        if args.max_steps and steps >= args.max_steps:
+        if args.max_steps and (steps >= args.max_steps or index + 1 >= args.max_steps):
             return
 
 
