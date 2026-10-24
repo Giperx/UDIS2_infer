@@ -6,6 +6,8 @@
 import argparse
 import importlib.util
 import os
+import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -66,6 +68,58 @@ def load_image(path, size):
     return tensor, original
 
 
+class MethodMemoryError(RuntimeError):
+    """The stitch itself needs more memory than the GPU, with nobody else using it."""
+
+
+def is_oom(exc):
+    return "out of memory" in str(exc).lower()
+
+
+def other_process_holds_gpu(exc=None, minimum_mib=1024):
+    me = os.getpid()
+    if exc is not None:
+        for pid, amount, unit in re.findall(r"Process (\d+) has ([0-9.]+) ([MG]iB)", str(exc)):
+            if int(pid) == me:
+                continue
+            mib = float(amount) * (1024 if unit.startswith("G") else 1)
+            if mib >= minimum_mib:
+                return True
+    gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0].strip() or "0"
+    try:
+        text = subprocess.check_output(
+            ["nvidia-smi", f"--id={gpu}", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
+            text=True, timeout=5, stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    for line in text.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 2:
+            continue
+        try:
+            pid, used = int(parts[0]), float(parts[1])
+        except ValueError:
+            continue
+        if pid != me and used >= minimum_mib:
+            return True
+    return False
+
+
+def oom_kind(exc):
+    if not is_oom(exc):
+        return None
+    return "contention" if other_process_holds_gpu(exc) else "method"
+
+
+def camera_on_white(image):
+    """Camera 5 in the middle, one camera width of white on each side."""
+    height, width = image.shape[:2]
+    canvas = np.full((height, width * 3, 3), 255, np.uint8)
+    canvas[:, width:width * 2] = image
+    return canvas
+
+
 def to_image(tensor):
     array = tensor[0].detach().float().cpu().numpy().transpose(1, 2, 0)
     return np.clip((array + 1.0) * 127.5, 0, 255).astype(np.uint8)
@@ -91,21 +145,32 @@ def main():
     warp_net.load_state_dict(state_of(args.warp))
     comp_net.load_state_dict(state_of(args.composition))
     size = (518, 434) if "1224" in args.dataset else (518, 294)
-    left, _original = load_image(image_dir / f"{frame}_5.jpg", size)
+    left, camera5 = load_image(image_dir / f"{frame}_5.jpg", size)
     right, _original = load_image(image_dir / f"{frame}_{args.side}.jpg", size)
-    with torch.no_grad():
-        warped = warp.build_output_model(warp_net, left, right)
-        stitched = composition.build_model(
-            comp_net,
-            warped["final_warp1"],
-            warped["final_warp2"],
-            warped["final_warp1_mask"][:, :1],
-            warped["final_warp2_mask"][:, :1],
-        )["stitched_image"]
+    try:
+        with torch.no_grad():
+            warped = warp.build_output_model(warp_net, left, right)
+            stitched = composition.build_model(
+                comp_net,
+                warped["final_warp1"],
+                warped["final_warp2"],
+                warped["final_warp1_mask"][:, :1],
+                warped["final_warp2_mask"][:, :1],
+            )["stitched_image"]
+        image = to_image(stitched)
+    except RuntimeError as exc:
+        torch.cuda.empty_cache()
+        kind = oom_kind(exc)
+        if kind == "contention":
+            print(f"keep camera 5 on white: another process holds the GPU ({exc})", flush=True)
+            image = camera_on_white(camera5)
+        else:
+            print(f"fail {frame}: method cannot stitch this frame, nothing saved ({exc})", flush=True)
+            return
     output = Path(args.output or ROOT / "outputs" / args.dataset / args.scene / "pairwise" / f"{frame}.png")
     output.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(output), to_image(stitched))
-    print(f"saved {output} canvas {stitched.shape[-1]}x{stitched.shape[-2]}", flush=True)
+    cv2.imwrite(str(output), image)
+    print(f"saved {output} canvas {image.shape[1]}x{image.shape[0]}", flush=True)
 
 
 if __name__ == "__main__":
